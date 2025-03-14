@@ -7,6 +7,7 @@ import json
 import duckdb
 from pydantic import BaseModel, Field
 import matplotlib.pyplot as plt  # Required for visualization
+from halo import Halo  # For better CLI experience
 
 from helper import get_openai_api_key
 
@@ -45,25 +46,32 @@ def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
 # code for tool 1
 def lookup_sales_data(prompt: str) -> str:
     """Implementation of sales data lookup from parquet file using SQL"""
+    spinner = Halo(text='Looking up sales data', spinner='dots')
+    spinner.start()
     try:
         # define the table name
         table_name = "sales"
         
         # step 1: read the parquet file into a DuckDB table
+        spinner.text = 'Reading parquet file'
         df = pd.read_parquet(TRANSACTION_DATA_FILE_PATH)
         duckdb.sql(f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM df")
 
         # step 2: generate the SQL code
+        spinner.text = 'Generating SQL query'
         sql_query = generate_sql_query(prompt, df.columns, table_name)
         # clean the response to make sure it only includes the SQL code
         sql_query = sql_query.strip()
         sql_query = sql_query.replace("```sql", "").replace("```", "")
         
         # step 3: execute the SQL query
+        spinner.text = 'Executing SQL query'
         result = duckdb.sql(sql_query).df()
         
+        spinner.succeed('Data lookup complete')
         return result.to_string()
     except Exception as e:
+        spinner.fail(f'Error accessing data')
         return f"Error accessing data: {str(e)}"
 
 # Construct prompt based on analysis type and data subset
@@ -75,14 +83,19 @@ Your job is to answer the following question: {prompt}
 # code for tool 2
 def analyze_sales_data(prompt: str, data: str) -> str:
     """Implementation of AI-powered sales data analysis"""
+    spinner = Halo(text='Analyzing sales data', spinner='dots')
+    spinner.start()
+    
     formatted_prompt = DATA_ANALYSIS_PROMPT.format(data=data, prompt=prompt)
 
+    spinner.text = 'Generating analysis'
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
     
     analysis = response.choices[0].message.content
+    spinner.succeed('Analysis complete')
     return analysis if analysis else "No analysis could be generated"
 
 # prompt template for step 1 of tool 3
@@ -109,6 +122,9 @@ def extract_chart_config(data: str, visualization_goal: str) -> dict:
     Returns:
         Dictionary containing line chart configuration
     """
+    spinner = Halo(text='Generating chart configuration', spinner='dots')
+    spinner.start()
+    
     formatted_prompt = CHART_CONFIGURATION_PROMPT.format(data=data,
                                                         visualization_goal=visualization_goal)
     
@@ -123,6 +139,7 @@ def extract_chart_config(data: str, visualization_goal: str) -> dict:
         content = response.choices[0].message.content
         
         # Return structured chart config
+        spinner.succeed('Chart configuration generated')
         return {
             "chart_type": content.chart_type,
             "x_axis": content.x_axis,
@@ -131,6 +148,7 @@ def extract_chart_config(data: str, visualization_goal: str) -> dict:
             "data": data
         }
     except Exception:
+        spinner.warn('Using default chart configuration')
         return {
             "chart_type": "line", 
             "x_axis": "date",
@@ -149,6 +167,9 @@ config: {config}
 # code for step 2 of tool 3
 def create_chart(config: dict) -> str:
     """Create a chart based on the configuration"""
+    spinner = Halo(text='Creating chart code', spinner='dots')
+    spinner.start()
+    
     formatted_prompt = CREATE_CHART_PROMPT.format(config=config)
     
     response = client.chat.completions.create(
@@ -160,13 +181,19 @@ def create_chart(config: dict) -> str:
     code = code.replace("```python", "").replace("```", "")
     code = code.strip()
     
+    spinner.succeed('Chart code created')
     return code
 
 # code for tool 3
 def generate_visualization(data: str, visualization_goal: str) -> str:
     """Generate a visualization based on the data and goal"""
+    spinner = Halo(text='Generating visualization', spinner='dots')
+    spinner.start()
+    
     config = extract_chart_config(data, visualization_goal)
     code = create_chart(config)
+    
+    spinner.succeed('Visualization code generated')
     return code
 
 # Define tools/functions that can be called by the model
@@ -226,11 +253,17 @@ tool_implementations = {
 
 # code for executing the tools returned in the model's response
 def handle_tool_calls(tool_calls, messages):
+    spinner = Halo(text='Handling tool calls', spinner='dots')
+    spinner.start()
+    
     for tool_call in tool_calls:   
         function = tool_implementations[tool_call.function.name]
         function_args = json.loads(tool_call.function.arguments)
+        spinner.text = f'Executing {tool_call.function.name}'
         result = function(**function_args)
         messages.append({"role": "tool", "content": result, "tool_call_id": tool_call.id})
+    
+    spinner.succeed('Tool calls handled')
     return messages
 
 SYSTEM_PROMPT = """
@@ -238,7 +271,8 @@ You are a helpful assistant that can answer questions about the Store Sales Pric
 """
 
 def run_agent(messages):
-    print("Running agent with messages:", messages)
+    spinner = Halo(text='Running agent', spinner='dots')
+    spinner.start()
 
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
@@ -251,7 +285,7 @@ def run_agent(messages):
             messages.append(system_prompt)
 
     while True:
-        print("Making router call to OpenAI")
+        spinner.text = 'Making router call to OpenAI'
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -259,14 +293,14 @@ def run_agent(messages):
         )
         messages.append(response.choices[0].message)
         tool_calls = response.choices[0].message.tool_calls
-        print("Received response with tool calls:", bool(tool_calls))
+        spinner.text = f'Received response with tool calls: {bool(tool_calls)}'
 
         # if the model decides to call function(s), call handle_tool_calls
         if tool_calls:
-            print("Processing tool calls")
+            spinner.text = 'Processing tool calls'
             messages = handle_tool_calls(tool_calls, messages)
         else:
-            print("No tool calls, returning final response")
+            spinner.succeed('Agent processing complete')
             return response.choices[0].message.content
 
 def main():
@@ -278,8 +312,8 @@ def main():
     args = parser.parse_args()
     
     result = run_agent(args.query)
-    print("\nAgent Response:")
-    print(result)
+    spinner = Halo(text='Agent Response:', spinner='dots')
+    spinner.info(result)
     
     # If the result contains Python code for visualization, ask if the user wants to execute it
     if "```python" in result or "import matplotlib" in result:
@@ -297,12 +331,14 @@ def main():
         
         user_input = input("\nVisualization code detected. Do you want to execute it and display the chart? (y/n): ")
         if user_input.lower() == 'y':
-            print("Executing visualization code...")
+            spinner = Halo(text='Executing visualization code', spinner='dots')
+            spinner.start()
             try:
                 exec(code)
                 plt.show()
+                spinner.succeed('Visualization complete')
             except Exception as e:
-                print(f"Error executing visualization code: {str(e)}")
+                spinner.fail(f'Error executing visualization code: {str(e)}')
 
 if __name__ == "__main__":
     main()

@@ -5,3 +5,4 @@ pydantic
 matplotlib
 python-dotenv
 pyarrow
+halo
