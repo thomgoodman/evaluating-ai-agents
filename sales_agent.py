@@ -8,13 +8,37 @@ import duckdb
 from pydantic import BaseModel, Field
 import matplotlib.pyplot as plt  # Required for visualization
 
-from helper import get_openai_api_key
+from helper import get_openai_api_key, get_phoenix_endpoint
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import phoenix as px
+import os
+from phoenix.otel import register
+from openinference.instrumentation.openai import OpenAIInstrumentor
+from openinference.semconv.trace import SpanAttributes
+from opentelemetry.trace import Status, StatusCode
+from openinference.instrumentation import TracerProvider
 
 # initialize the OpenAI client
 openai_api_key = get_openai_api_key()
 client = OpenAI(api_key=openai_api_key)
 
 MODEL = "gpt-4o-mini"  # You can change this to a model you have access to
+
+PROJECT_NAME = "tracing-agent"
+
+tracer_provider = register(
+    project_name=PROJECT_NAME,
+    endpoint= get_phoenix_endpoint() + "v1/traces"
+)
+
+# automatically collect OAI calls
+OpenAIInstrumentor().instrument(tracer_provider = tracer_provider)
+
+# create tracer object for spans
+tracer = tracer_provider.get_tracer(__name__)
 
 # define the path to the transactional data
 TRANSACTION_DATA_FILE_PATH = 'data/Store_Sales_Price_Elasticity_Promotions_Data.parquet'
@@ -43,6 +67,7 @@ def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
     return response.choices[0].message.content
 
 # code for tool 1
+@tracer.tool()
 def lookup_sales_data(prompt: str) -> str:
     """Implementation of sales data lookup from parquet file using SQL"""
     try:
@@ -59,8 +84,12 @@ def lookup_sales_data(prompt: str) -> str:
         sql_query = sql_query.strip()
         sql_query = sql_query.replace("```sql", "").replace("```", "")
         
-        # step 3: execute the SQL query
-        result = duckdb.sql(sql_query).df()
+        with tracer.start_as_current_span("execute_sql_query", openinference_span_kind="chain") as span:
+            span.set_input(sql_query)
+            # step 3: execute the SQL query
+            result = duckdb.sql(sql_query).df()
+            span.set_output(value=str(result))
+            span.set_status(StatusCode.OK)
         
         return result.to_string()
     except Exception as e:
@@ -73,6 +102,7 @@ Your job is to answer the following question: {prompt}
 """
 
 # code for tool 2
+@tracer.tool()
 def analyze_sales_data(prompt: str, data: str) -> str:
     """Implementation of AI-powered sales data analysis"""
     formatted_prompt = DATA_ANALYSIS_PROMPT.format(data=data, prompt=prompt)
@@ -99,6 +129,7 @@ class VisualizationConfig(BaseModel):
     title: str = Field(..., description="Title of the chart")
 
 # code for step 1 of tool 3
+@tracer.chain()
 def extract_chart_config(data: str, visualization_goal: str) -> dict:
     """Generate chart visualization configuration
     
@@ -147,6 +178,7 @@ config: {config}
 """
 
 # code for step 2 of tool 3
+@tracer.chain()
 def create_chart(config: dict) -> str:
     """Create a chart based on the configuration"""
     formatted_prompt = CREATE_CHART_PROMPT.format(config=config)
@@ -163,6 +195,7 @@ def create_chart(config: dict) -> str:
     return code
 
 # code for tool 3
+@tracer.tool()
 def generate_visualization(data: str, visualization_goal: str) -> str:
     """Generate a visualization based on the data and goal"""
     config = extract_chart_config(data, visualization_goal)
@@ -225,6 +258,7 @@ tool_implementations = {
 }
 
 # code for executing the tools returned in the model's response
+@tracer.chain()
 def handle_tool_calls(tool_calls, messages):
     for tool_call in tool_calls:   
         function = tool_implementations[tool_call.function.name]
@@ -251,23 +285,46 @@ def run_agent(messages):
             messages.append(system_prompt)
 
     while True:
-        print("Making router call to OpenAI")
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-        )
-        messages.append(response.choices[0].message)
-        tool_calls = response.choices[0].message.tool_calls
-        print("Received response with tool calls:", bool(tool_calls))
+        # Router Span
+        print("Starting router call span")
+        with tracer.start_as_current_span(
+            "router_call", openinference_span_kind="chain",
+        ) as span:
+            span.set_input(value=messages)
+            
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=tools,
+            )
+            messages.append(response.choices[0].message)
+            tool_calls = response.choices[0].message.tool_calls
+            print("Received response with tool calls:", bool(tool_calls))
+            span.set_status(StatusCode.OK)
 
-        # if the model decides to call function(s), call handle_tool_calls
-        if tool_calls:
-            print("Processing tool calls")
-            messages = handle_tool_calls(tool_calls, messages)
-        else:
-            print("No tool calls, returning final response")
-            return response.choices[0].message.content
+            # if the model decides to call function(s), call handle_tool_calls
+            if tool_calls:
+                print("Processing tool calls")
+                messages = handle_tool_calls(tool_calls, messages)
+                span.set_output(value=tool_calls)
+                
+            else:
+                print("No tool calls, returning final response")
+                span.set_output(value=response.choices[0].message.content)
+                return response.choices[0].message.content
+
+def start_main_span(messages):
+    print("Starting main span with messages:", messages)
+    
+    with tracer.start_as_current_span(
+        "AgentRun", openinference_span_kind="agent"
+    ) as span:
+        span.set_input(value=messages)
+        ret = run_agent(messages)
+        print("Main span completed with return value:", ret)
+        span.set_output(value=ret)
+        span.set_status(StatusCode.OK)
+        return ret
 
 def main():
     """Main function to run the app as a command-line tool"""
@@ -277,7 +334,7 @@ def main():
     parser.add_argument('query', type=str, help='Query for the sales agent')
     args = parser.parse_args()
     
-    result = run_agent(args.query)
+    result = start_main_span(args.query)
     print("\nAgent Response:")
     print(result)
     

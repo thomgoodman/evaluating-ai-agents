@@ -5,3 +5,6 @@ pydantic
 matplotlib
 python-dotenv
 pyarrow
+arize-phoenix-otel
+openinference-instrumentation-openai
+opentelemetry-api
