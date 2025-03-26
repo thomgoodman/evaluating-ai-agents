@@ -8,3 +8,5 @@ pyarrow
 arize-phoenix-otel
 openinference-instrumentation-openai
 opentelemetry-api
+nest-asyncio
+tqdm
